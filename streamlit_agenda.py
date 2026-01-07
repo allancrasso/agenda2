@@ -1,24 +1,25 @@
 # streamlit_agenda.py
 # -*- coding: utf-8 -*-
 """
-Agenda / Links em Streamlit com SQLite
-- CRUD de Links e Tarefas
-- Prioridade + ordenação por prioridade, devido (due) e sort_index (reordenação manual)
-- Recorrência 'once' e 'daily'
-- Marcar concluído / reset notificação
-- Checar lembretes e enviar notificação via plyer se disponível
+Agenda Streamlit + Calendar + Links
+- Banco: SQLite em ~/.streamlit_agenda.db
+- Abas: Agenda (list), Calendar (monthly view), Links, Config/Notificações
+- Funcionalidades: CRUD tasks/links, prioridade, reordenação, marcar concluído,
+  notificações (plyer optional), abrir pastas locais (quando rodando localmente)
 """
 
+from pathlib import Path
 import os
 import sqlite3
 from datetime import datetime, date, time, timedelta
+import calendar as _pycalendar
 import webbrowser
 import platform
 import subprocess
 
 import streamlit as st
 
-# Try plyer for OS notifications
+# Try plyer for OS notifications (optional)
 try:
     from plyer import notification
     HAS_PLYER = True
@@ -48,11 +49,11 @@ def init_db():
         title TEXT NOT NULL,
         description TEXT,
         due_iso TEXT NOT NULL,
-        recurrence TEXT DEFAULT 'once', -- 'once' or 'daily'
+        recurrence TEXT DEFAULT 'once',
         folder_path TEXT,
-        priority INTEGER DEFAULT 0,     -- higher is more important
-        sort_index INTEGER DEFAULT 0,   -- custom ordering (lower appears first)
-        last_notified_date TEXT,        -- YYYY-MM-DD of last notification
+        priority INTEGER DEFAULT 0,
+        sort_index INTEGER DEFAULT 0,
+        last_notified_date TEXT,
         completed INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
@@ -86,17 +87,24 @@ def delete_link(link_id):
 
 # Tasks CRUD
 def add_task(title, description, due_dt: datetime, recurrence='once', folder_path=None, priority=0):
+    # use timestamp as default sort_index
+    si = int(datetime.now().timestamp() * 1000)
     run_query(
         "INSERT INTO tasks (title, description, due_iso, recurrence, folder_path, priority, sort_index) VALUES (?,?,?,?,?,?,?)",
-        (title, description, due_dt.isoformat(), recurrence, folder_path, int(priority), int(datetime.now().timestamp()))
+        (title, description, due_dt.isoformat(), recurrence, folder_path, int(priority), si)
     )
 
 def get_tasks(order_by_custom=True):
-    # order: sort_index asc (custom), priority desc, due_iso asc
     if order_by_custom:
-        return run_query("SELECT id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed FROM tasks ORDER BY sort_index ASC, priority DESC, due_iso ASC", fetch=True)
+        return run_query(
+            "SELECT id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed FROM tasks ORDER BY sort_index ASC, priority DESC, due_iso ASC",
+            fetch=True
+        )
     else:
-        return run_query("SELECT id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed FROM tasks ORDER BY priority DESC, due_iso ASC", fetch=True)
+        return run_query(
+            "SELECT id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed FROM tasks ORDER BY priority DESC, due_iso ASC",
+            fetch=True
+        )
 
 def update_task(task_id, title, description, due_dt: datetime, recurrence, folder_path, priority):
     run_query("UPDATE tasks SET title=?, description=?, due_iso=?, recurrence=?, folder_path=?, priority=? WHERE id=?",
@@ -112,7 +120,6 @@ def set_task_completed(task_id, completed=True):
     run_query("UPDATE tasks SET completed=? WHERE id=?", (1 if completed else 0, task_id))
 
 def swap_sort_index(task_id, other_id):
-    # swap the sort_index values of two tasks
     vals = run_query("SELECT id, sort_index FROM tasks WHERE id IN (?,?)", (task_id, other_id), fetch=True)
     if len(vals) != 2:
         return
@@ -122,9 +129,9 @@ def swap_sort_index(task_id, other_id):
     run_query("UPDATE tasks SET sort_index=? WHERE id=?", (a_idx, b_id))
 
 # ---------------- Utilities ----------------
+from urllib.parse import urlparse
 def is_valid_url(s):
     try:
-        from urllib.parse import urlparse
         p = urlparse(s)
         return p.scheme in ('http', 'https') and p.netloc != ''
     except Exception:
@@ -146,38 +153,43 @@ def open_folder_local(path):
         return False
 
 def notify_os(title, message):
-    # prefer plyer; fallback to Streamlit message
     if HAS_PLYER:
         try:
             notification.notify(title=title, message=message, timeout=8)
             return True
-        except Exception as e:
-            st.warning(f"plyer notify falhou: {e}")
-    # fallback: display in Streamlit UI
+        except Exception:
+            pass
+    # fallback: message in UI
     st.info(f"NOTIFICAÇÃO: **{title}** — {message}")
     return False
 
-def parse_datetime_from_inputs(date_obj, time_obj):
-    if isinstance(date_obj, datetime):
-        d = date_obj.date()
-    else:
-        d = date_obj
-    if isinstance(time_obj, datetime):
-        t = time_obj.time()
-    else:
-        t = time_obj
-    return datetime.combine(d, t)
+def parse_iso_or_flex(s):
+    # try various common formats
+    if not s:
+        return None
+    fmt_try = [ "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+               "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+               "%Y-%m-%d" ]
+    for f in fmt_try:
+        try:
+            return datetime.strptime(s, f)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 # ---------------- Notification checker ----------------
 def check_due_tasks(window_minutes=DEFAULT_CHECK_WINDOW_MINUTES):
     now = datetime.now()
     window_end = now + timedelta(minutes=window_minutes)
-    tasks = get_tasks(order_by_custom=False)  # simpler list
+    tasks = get_tasks(order_by_custom=False)
     upcoming = []
     for t in tasks:
         task_id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed = t
         try:
-            due_dt = datetime.fromisoformat(due_iso)
+            due_dt = parse_iso_or_flex(due_iso) or datetime.fromisoformat(due_iso)
         except Exception:
             continue
         notify_flag = False
@@ -194,7 +206,6 @@ def check_due_tasks(window_minutes=DEFAULT_CHECK_WINDOW_MINUTES):
                     notify_flag = True
         if notify_flag:
             upcoming.append((task_id, title, description, due_dt, folder_path, priority))
-    # send notifications and mark
     for task_id, title, description, due_dt, folder_path, priority in upcoming:
         msg = (description or '') + (f"\nPasta: {folder_path}" if folder_path else '')
         notify_os(f"Lembrete: {title} — {due_dt.strftime('%Y-%m-%d %H:%M')}", msg)
@@ -205,9 +216,10 @@ def check_due_tasks(window_minutes=DEFAULT_CHECK_WINDOW_MINUTES):
 st.set_page_config(page_title="Agenda Streamlit", layout="wide")
 init_db()
 
-st.title("📆 Agenda / Links")
+st.title("📆 Agenda / Links (Streamlit)")
 
-tabs = st.tabs(["Agenda", "Links", "Config / Notificações"])
+# tabs: Agenda, Calendar, Links, Config
+tabs = st.tabs(["Agenda", "Calendar", "Links", "Config / Notificações"])
 
 # ---------------- Agenda Tab ----------------
 with tabs[0]:
@@ -224,13 +236,13 @@ with tabs[0]:
             priority_label = st.selectbox("Prioridade (rótulo)", ["Baixa","Média","Alta"])
             priority_map = {"Baixa": 1, "Média": 5, "Alta": 10}
             priority = priority_map[priority_label]
-            folder_path = st.text_input("Pasta relacionada (opcional)", placeholder="Digite caminho local (ex: C:\\Users\\Allan\\Docs)")
+            folder_path = st.text_input("Pasta relacionada (opcional)", placeholder="Caminho local (abertura apenas local).")
         submitted = st.form_submit_button("Adicionar tarefa")
         if submitted:
             if not title:
                 st.warning("Informe título e data/hora.")
             else:
-                due_dt = parse_datetime_from_inputs(due_date, due_time)
+                due_dt = datetime.combine(due_date, due_time)
                 add_task(title.strip(), description.strip() or None, due_dt, recurrence, folder_path.strip() or None, priority)
                 st.success("Tarefa adicionada.")
                 st.experimental_rerun()
@@ -239,7 +251,6 @@ with tabs[0]:
     st.header("Tarefas — lista e ações")
     show_completed = st.checkbox("Mostrar tarefas concluídas", value=False)
     tasks = get_tasks()
-    # filter completed if needed
     rows = []
     for t in tasks:
         if not show_completed and t[9] == 1:
@@ -249,10 +260,10 @@ with tabs[0]:
     if not rows:
         st.info("Nenhuma tarefa cadastrada.")
     else:
-        # Render each task with action buttons
         for t in rows:
             task_id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed = t
-            due_display = due_iso.replace('T',' ')
+            due_dt = parse_iso_or_flex(due_iso) or (datetime.fromisoformat(due_iso) if due_iso else None)
+            due_display = due_dt.strftime("%Y-%m-%d %H:%M") if due_dt else due_iso
             priority_label = "Alta" if priority >= 10 else ("Média" if priority >=5 else "Baixa")
             cols = st.columns([4,1,1,1,1,1])
             with cols[0]:
@@ -262,8 +273,6 @@ with tabs[0]:
                 st.caption(f"Due: {due_display}  ·  Recorrência: {recurrence}  ·  Prioridade: {priority_label}  ·  Notificado: {last_notified_date or '—'}")
             # Move up / down
             if cols[1].button("⬆️", key=f"up_{task_id}"):
-                # find previous by sort_index
-                # get all tasks ordered by sort_index
                 all_tasks = get_tasks()
                 idxs = [r[0] for r in all_tasks]
                 try:
@@ -297,7 +306,7 @@ with tabs[0]:
             if cols[5].button("🗑️ Excluir", key=f"del_{task_id}"):
                 delete_task(task_id)
                 st.experimental_rerun()
-            # Open folder below (if exists)
+            # Open folder if exists
             if folder_path:
                 try:
                     st.write(f"Pasta: `{folder_path}`")
@@ -314,7 +323,6 @@ with tabs[0]:
     # Edit form (if requested)
     if "edit_task_id" in st.session_state:
         edit_id = st.session_state.get("edit_task_id")
-        # load values
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT title,description,due_iso,recurrence,folder_path,priority FROM tasks WHERE id=?", (edit_id,))
@@ -326,9 +334,8 @@ with tabs[0]:
             with st.form(f"edit_task_form_{edit_id}"):
                 etitle = st.text_input("Título", value=e_title)
                 edesc = st.text_area("Descrição", value=e_description or "")
-                # parse due
                 try:
-                    edue_dt = datetime.fromisoformat(e_due_iso)
+                    edue_dt = parse_iso_or_flex(e_due_iso) or datetime.fromisoformat(e_due_iso)
                     edate = st.date_input("Data (due date)", value=edue_dt.date())
                     etime = st.time_input("Hora", value=edue_dt.time())
                 except Exception:
@@ -343,7 +350,7 @@ with tabs[0]:
                 btn_save = st.form_submit_button("Salvar alterações")
                 btn_cancel = st.form_submit_button("Cancelar edição")
                 if btn_save:
-                    new_due = parse_datetime_from_inputs(edate, etime)
+                    new_due = datetime.combine(edate, etime)
                     update_task(edit_id, etitle.strip(), edesc.strip() or None, new_due, erec, efolder.strip() or None, epriority)
                     st.success("Tarefa atualizada.")
                     del st.session_state["edit_task_id"]
@@ -352,8 +359,144 @@ with tabs[0]:
                     del st.session_state["edit_task_id"]
                     st.experimental_rerun()
 
-# ---------------- Links Tab ----------------
+# ---------------- Calendar Tab ----------------
+def tasks_by_day_map(year, month):
+    rows = get_tasks(order_by_custom=False)
+    m = {}
+    for r in rows:
+        task_id, title, description, due_iso, recurrence, folder_path, priority, sort_index, last_notified_date, completed = r
+        due_dt = parse_iso_or_flex(due_iso)
+        if due_dt is None:
+            try:
+                due_dt = datetime.fromisoformat(due_iso)
+            except Exception:
+                continue
+        if due_dt.year == year and due_dt.month == month:
+            day = due_dt.day
+            m.setdefault(day, []).append((task_id, title, description, due_dt, recurrence, priority, folder_path, completed))
+    return m
+
 with tabs[1]:
+    st.header("📅 Calendário — visão mensal")
+    col1, col2, col3 = st.columns([1,1,3])
+    if "cal_year" not in st.session_state:
+        st.session_state.cal_year = datetime.now().year
+    if "cal_month" not in st.session_state:
+        st.session_state.cal_month = datetime.now().month
+
+    with col1:
+        if st.button("◀️ Mês anterior"):
+            y, m = st.session_state.cal_year, st.session_state.cal_month - 1
+            if m < 1:
+                m = 12; y -= 1
+            st.session_state.cal_year, st.session_state.cal_month = y, m
+            st.experimental_rerun()
+    with col2:
+        if st.button("Próximo mês ▶️"):
+            y, m = st.session_state.cal_year, st.session_state.cal_month + 1
+            if m > 12:
+                m = 1; y += 1
+            st.session_state.cal_year, st.session_state.cal_month = y, m
+            st.experimental_rerun()
+    with col3:
+        st.markdown(f"### {st.session_state.cal_year} — {_pycalendar.month_name[st.session_state.cal_month]}")
+        # quick jump (today)
+        if st.button("Ir para hoje"):
+            st.session_state.cal_year = datetime.now().year
+            st.session_state.cal_month = datetime.now().month
+            st.experimental_rerun()
+
+    year = st.session_state.cal_year
+    month = st.session_state.cal_month
+    mapping = tasks_by_day_map(year, month)
+
+    cal = _pycalendar.Calendar(firstweekday=0)
+    month_matrix = cal.monthdayscalendar(year, month)
+
+    # header weekdays
+    weekday_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    cols_head = st.columns(7)
+    for i, name in enumerate(weekday_names):
+        with cols_head[i]:
+            st.markdown(f"**{name}**")
+
+    for week in month_matrix:
+        cols = st.columns(7)
+        for i, day in enumerate(week):
+            with cols[i]:
+                if day == 0:
+                    st.write("")  # empty
+                else:
+                    day_tasks = mapping.get(day, [])
+                    high = sum(1 for t in day_tasks if t[5] >= 10)
+                    med  = sum(1 for t in day_tasks if 5 <= t[5] < 10)
+                    low  = sum(1 for t in day_tasks if 1 <= t[5] < 5)
+                    st.markdown(f"**{day}**")
+                    if high:
+                        st.markdown(f"<small>🔴 {high}</small>", unsafe_allow_html=True)
+                    if med:
+                        st.markdown(f"<small>🟠 {med}</small>", unsafe_allow_html=True)
+                    if low:
+                        st.markdown(f"<small>🟢 {low}</small>", unsafe_allow_html=True)
+                    for t in day_tasks[:3]:
+                        tid, title, desc, due_dt, rec, pr, folder, completed = t
+                        time_str = due_dt.strftime("%H:%M")
+                        st.write(f"- {time_str} • {title}" if title else f"- {time_str}")
+                    if st.button(f"Ver {day}", key=f"viewday_{year}_{month}_{day}"):
+                        st.session_state.selected_calendar_day = datetime(year, month, day)
+                        st.experimental_rerun()
+    st.markdown("---")
+    if "selected_calendar_day" in st.session_state:
+        sel = st.session_state.selected_calendar_day
+        st.subheader(f"Compromissos em {sel.strftime('%Y-%m-%d')}")
+        day_tasks = mapping.get(sel.day, [])
+        if not day_tasks:
+            st.info("Nenhum compromisso neste dia.")
+        else:
+            for t in day_tasks:
+                tid, title, desc, due_dt, rec, pr, folder, completed = t
+                pr_label = "Alta" if pr>=10 else ("Média" if pr>=5 else "Baixa")
+                cols = st.columns([4,1,1])
+                with cols[0]:
+                    st.markdown(f"**{due_dt.strftime('%H:%M')} — {title}**  {'✅' if completed else ''}")
+                    if desc:
+                        st.write(desc)
+                    st.caption(f"Recorrência: {rec}  ·  Prioridade: {pr_label}  ·  Pasta: {folder or '—'}")
+                with cols[1]:
+                    if st.button("✏️ Editar", key=f"cal_edit_{tid}"):
+                        st.session_state.edit_task_id = tid
+                        st.experimental_rerun()
+                with cols[2]:
+                    if st.button("🗑️ Excluir", key=f"cal_del_{tid}"):
+                        delete_task(tid)
+                        st.success("Tarefa excluída.")
+                        st.session_state.selected_calendar_day = sel
+                        st.experimental_rerun()
+        st.markdown("### Adicionar tarefa neste dia")
+        with st.form("add_task_calendar_form", clear_on_submit=False):
+            atitle = st.text_input("Título", key="cal_new_title")
+            adesc = st.text_area("Descrição", key="cal_new_desc")
+            default_date = sel.date()
+            adate = st.date_input("Data", value=default_date, key="cal_new_date")
+            atime = st.time_input("Hora", value=datetime.now().time().replace(second=0,microsecond=0), key="cal_new_time")
+            arecur = st.selectbox("Recorrência", ['once','daily'], key="cal_new_recur")
+            aprio_label = st.selectbox("Prioridade", ["Baixa","Média","Alta"], key="cal_new_prio")
+            aprio_map = {"Baixa":1,"Média":5,"Alta":10}
+            aprio_val = aprio_map[aprio_label]
+            afolder = st.text_input("Pasta (opcional)", key="cal_new_folder")
+            sub = st.form_submit_button("Adicionar compromisso")
+            if sub:
+                if not atitle:
+                    st.warning("Informe um título.")
+                else:
+                    new_dt = datetime.combine(adate, atime)
+                    add_task(atitle.strip(), adesc.strip() or None, new_dt, arecur, afolder.strip() or None, aprio_val)
+                    st.success("Tarefa adicionada.")
+                    st.session_state.selected_calendar_day = sel
+                    st.experimental_rerun()
+
+# ---------------- Links Tab ----------------
+with tabs[2]:
     st.header("Links")
     with st.form("add_link_form", clear_on_submit=True):
         lcol1, lcol2 = st.columns([3,1])
@@ -433,7 +576,7 @@ with tabs[1]:
                     st.experimental_rerun()
 
 # ---------------- Config / Notifications Tab ----------------
-with tabs[2]:
+with tabs[3]:
     st.header("Notificações & Configurações")
     st.write("Verifique tarefas que vencem nos próximos N minutos e receba uma notificação (plyer) ou mensagens na interface.")
     window_minutes = st.number_input("Janela de busca (minutos)", min_value=1, max_value=24*60, value=DEFAULT_CHECK_WINDOW_MINUTES)
@@ -442,15 +585,18 @@ with tabs[2]:
         if upcoming:
             st.success(f"{len(upcoming)} lembrete(s) exibido(s).")
             for t in upcoming:
-                st.write(f"- **{t[1]}** — {t[3].strftime('%Y-%m-%d %H:%M')} — {t[5]}")
+                st.write(f"- **{t[1]}** — {t[3].strftime('%Y-%m-%d %H:%M')} — prioridade {t[5]}")
         else:
             st.info("Nenhuma tarefa a notificar neste intervalo.")
 
     st.markdown("---")
     st.write("Opções avançadas / observações")
     st.write("""
-    - A notificação automática em background **não** é ativada por padrão neste app Streamlit (porque execução de threads em Streamlit pode ser instável dependendo do ambiente).  
+    - A notificação automática em background **não** é ativada por padrão neste app Streamlit (threads em Streamlit podem ser instáveis dependendo do ambiente).  
     - Use 'Checar lembretes agora' para forçar avaliação local e receber notificações.
     - Abrir pastas funciona somente quando rodando localmente (com acesso ao sistema de arquivos).
-    - Banco de dados: `~/.streamlit_agenda.db`
+    - Banco de dados local: `~/.streamlit_agenda.db`
+    - Para deploy no Streamlit Cloud, remova `plyer` de requirements.txt (notificações desktop não funcionarão no servidor).
     """)
+
+# End of file

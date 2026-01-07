@@ -1,0 +1,3 @@
+# requirements.txt
+streamlit
+plyer    # opcional, mas cuidado: notificações desktop NÃO funcionam em cloud

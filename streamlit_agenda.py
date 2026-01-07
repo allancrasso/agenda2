@@ -216,7 +216,7 @@ def check_due_tasks(window_minutes=DEFAULT_CHECK_WINDOW_MINUTES):
 st.set_page_config(page_title="Agenda Streamlit", layout="wide")
 init_db()
 
-st.title("📆 Agenda / Links (Streamlit)")
+st.title("📆 Agenda / Links")
 
 # tabs: Agenda, Calendar, Links, Config
 tabs = st.tabs(["Agenda", "Calendar", "Links", "Config / Notificações"])
@@ -600,3 +600,4 @@ with tabs[3]:
     """)
 
 # End of file
+
